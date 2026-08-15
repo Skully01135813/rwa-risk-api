@@ -1,9 +1,19 @@
-from fastapi import FastAPI
+import os
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from openai import OpenAI
 from pydantic import BaseModel
+
+load_dotenv()
 
 app = FastAPI(
     title="RWA AI Risk Analyst",
-    version="1.1.0",
+    version="2.0.0",
+)
+
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY")
 )
 
 
@@ -20,6 +30,11 @@ class RiskRequest(BaseModel):
     riskTriggered: bool
 
 
+class AIRiskNarrative(BaseModel):
+    summary: str
+    recommendedAction: str
+
+
 class RiskResponse(BaseModel):
     riskLevel: str
     summary: str
@@ -33,7 +48,8 @@ def root():
     return {
         "service": "RWA AI Risk Analyst",
         "status": "running",
-        "version": "1.1.0",
+        "version": "2.0.0",
+        "aiEnabled": True,
     }
 
 
@@ -52,112 +68,101 @@ def analyze_risk(data: RiskRequest):
         / data.previousValuation
     ) * 100
 
-    ltv_change = (
-        data.currentLTV
-        - data.previousLTV
-    )
-
-    # ------------------------------------------------
-    # CASE 1:
-    # Risk threshold is breached
-    # ------------------------------------------------
-
     if data.riskTriggered:
         risk_level = "HIGH"
         requires_human_review = True
-
-        # --------------------------------------------
-        # New or changed risk event
-        # --------------------------------------------
-
-        if abs(valuation_change) >= 0.01:
-            summary = (
-                f"{data.portfolioName} has entered or changed "
-                f"a high-risk condition. "
-                f"The portfolio valuation changed by "
-                f"{valuation_change:.2f}% from "
-                f"${data.previousValuation:,.0f} to "
-                f"${data.currentValuation:,.0f}. "
-                f"LTV changed from "
-                f"{data.previousLTV:.2f}% to "
-                f"{data.currentLTV:.2f}%. "
-                f"The current LTV exceeds the "
-                f"{data.riskThreshold:.2f}% threshold by "
-                f"{threshold_breach:.2f} percentage points."
-            )
-
-            recommended_action = (
-                "Confirm the latest valuation source, review "
-                "collateral adequacy, and assess whether "
-                "deleveraging or additional collateral is required."
-            )
-
-        # --------------------------------------------
-        # Ongoing risk condition
-        # --------------------------------------------
-
-        else:
-            summary = (
-                f"{data.portfolioName} remains in a high-risk "
-                f"condition. "
-                f"The latest external valuation of "
-                f"${data.currentValuation:,.0f} matches the "
-                f"current on-chain valuation. "
-                f"LTV remains at "
-                f"{data.currentLTV:.2f}%, which exceeds the "
-                f"{data.riskThreshold:.2f}% threshold by "
-                f"{threshold_breach:.2f} percentage points. "
-                f"No valuation update is required at this time."
-            )
-
-            recommended_action = (
-                "Continue active monitoring and review the "
-                "collateral position. Consider deleveraging "
-                "or adding collateral while the LTV remains "
-                "above the configured threshold."
-            )
-
-    # ------------------------------------------------
-    # CASE 2:
-    # Portfolio is within threshold
-    # ------------------------------------------------
-
     else:
         risk_level = "LOW"
         requires_human_review = False
 
-        if abs(valuation_change) >= 0.01:
-            summary = (
-                f"{data.portfolioName} remains within the "
-                f"configured risk threshold. "
-                f"The valuation changed by "
-                f"{valuation_change:.2f}% and LTV changed by "
-                f"{ltv_change:.2f} percentage points to "
-                f"{data.currentLTV:.2f}%. "
-                f"The current threshold is "
-                f"{data.riskThreshold:.2f}%."
+    system_prompt = """
+You are an RWA portfolio risk analyst.
+
+The financial calculations, risk threshold, and risk classification
+provided to you are trusted deterministic inputs from Chainlink CRE
+and smart-contract state.
+
+You must not recalculate, alter, override, or contradict those values.
+
+Your job is only to explain the verified risk position and provide
+a concise, conservative recommendation for human review.
+
+Rules:
+- Never invent financial values.
+- Never change the supplied risk classification.
+- Never claim a valuation changed if previous and current valuation are equal.
+- If risk remains above threshold and valuation is unchanged, describe it as
+  an ongoing risk condition.
+- Do not instruct the system to execute blockchain transactions.
+- Recommendations are advisory only.
+- Keep the summary to a maximum of 4 sentences.
+- Keep the recommended action to a maximum of 2 sentences.
+- Do not use numbered lists or bullet points.
+- Use plain professional English.
+- Use standard ASCII punctuation only.
+- Avoid special dashes, smart quotes, or unusual Unicode characters.
+- Focus on the most important risk information rather than repeating every input.
+"""
+
+    user_prompt = f"""
+Portfolio ID: {data.portfolioId}
+Portfolio name: {data.portfolioName}
+
+Previous valuation: ${data.previousValuation:,.0f}
+Current valuation: ${data.currentValuation:,.0f}
+Valuation change: {valuation_change:.2f}%
+
+Debt: ${data.debt:,.0f}
+
+Previous LTV: {data.previousLTV:.2f}%
+Current LTV: {data.currentLTV:.2f}%
+
+Risk threshold: {data.riskThreshold:.2f}%
+Threshold breach: {threshold_breach:.2f} percentage points
+
+Valuation confidence: {data.valuationConfidence:.2f}%
+
+Risk triggered: {data.riskTriggered}
+Risk level: {risk_level}
+Human review required: {requires_human_review}
+"""
+
+    try:
+        response = client.responses.parse(
+            model="gpt-5-mini",
+            input=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            text_format=AIRiskNarrative,
+        )
+
+        analysis = response.output_parsed
+
+        if analysis is None:
+            raise RuntimeError(
+                "Model returned no structured analysis."
             )
 
-        else:
-            summary = (
-                f"{data.portfolioName} remains within the "
-                f"configured risk threshold. "
-                f"The latest valuation matches the current "
-                f"on-chain valuation and LTV remains at "
-                f"{data.currentLTV:.2f}%."
-            )
-
-        recommended_action = (
-            "Continue normal portfolio monitoring."
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI analysis failed: {exc}",
         )
 
     return RiskResponse(
         riskLevel=risk_level,
-        summary=summary,
+        summary=analysis.summary,
         thresholdBreach=round(
             threshold_breach,
             2,
         ),
-        recommendedAction=recommended_action,
+        recommendedAction=analysis.recommendedAction,
         requiresHumanReview=requires_human_review,
     )
