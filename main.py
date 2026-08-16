@@ -4,16 +4,35 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel
+from supabase import create_client, Client
 
 load_dotenv()
 
 app = FastAPI(
     title="RWA AI Risk Analyst",
-    version="2.0.0",
+    version="3.1.0",
 )
 
-client = OpenAI(
+openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
+)
+
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_SECRET_KEY")
+
+if not supabase_url:
+    raise RuntimeError(
+        "SUPABASE_URL is not configured."
+    )
+
+if not supabase_key:
+    raise RuntimeError(
+        "SUPABASE_SECRET_KEY is not configured."
+    )
+
+supabase: Client = create_client(
+    supabase_url,
+    supabase_key,
 )
 
 
@@ -43,20 +62,126 @@ class RiskResponse(BaseModel):
     requiresHumanReview: bool
 
 
+class RiskHistoryItem(BaseModel):
+    id: int
+    portfolioId: str
+    portfolioName: str
+    valuation: float
+    debt: float
+    ltv: float
+    riskThreshold: float
+    thresholdBreach: float
+    riskLevel: str
+    riskTriggered: bool
+    valuationConfidence: float | None
+    aiSummary: str | None
+    recommendedAction: str | None
+    requiresHumanReview: bool
+    createdAt: str
+
+
 @app.get("/")
 def root():
     return {
         "service": "RWA AI Risk Analyst",
         "status": "running",
-        "version": "2.0.0",
+        "version": "3.1.0",
         "aiEnabled": True,
+        "historyEnabled": True,
     }
 
 
-@app.post("/analyze", response_model=RiskResponse)
-def analyze_risk(data: RiskRequest):
+@app.get(
+    "/history/{portfolio_id}",
+    response_model=list[RiskHistoryItem],
+)
+def get_risk_history(
+    portfolio_id: str,
+):
+    try:
+        response = (
+            supabase
+            .table("risk_history")
+            .select("*")
+            .eq(
+                "portfolio_id",
+                portfolio_id,
+            )
+            .order(
+                "created_at",
+                desc=True,
+            )
+            .limit(50)
+            .execute()
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Risk history query failed: {exc}",
+        )
+
+    history = []
+
+    for row in response.data:
+        history.append(
+            RiskHistoryItem(
+                id=row["id"],
+                portfolioId=row["portfolio_id"],
+                portfolioName=row["portfolio_name"],
+                valuation=float(
+                    row["valuation"]
+                ),
+                debt=float(
+                    row["debt"]
+                ),
+                ltv=float(
+                    row["ltv"]
+                ),
+                riskThreshold=float(
+                    row["risk_threshold"]
+                ),
+                thresholdBreach=float(
+                    row["threshold_breach"]
+                ),
+                riskLevel=row["risk_level"],
+                riskTriggered=row["risk_triggered"],
+                valuationConfidence=(
+                    float(
+                        row[
+                            "valuation_confidence"
+                        ]
+                    )
+                    if row[
+                        "valuation_confidence"
+                    ]
+                    is not None
+                    else None
+                ),
+                aiSummary=row["ai_summary"],
+                recommendedAction=row[
+                    "recommended_action"
+                ],
+                requiresHumanReview=row[
+                    "requires_human_review"
+                ],
+                createdAt=row["created_at"],
+            )
+        )
+
+    return history
+
+
+@app.post(
+    "/analyze",
+    response_model=RiskResponse,
+)
+def analyze_risk(
+    data: RiskRequest,
+):
     threshold_breach = max(
-        data.currentLTV - data.riskThreshold,
+        data.currentLTV
+        - data.riskThreshold,
         0,
     )
 
@@ -128,19 +253,23 @@ Human review required: {requires_human_review}
 """
 
     try:
-        response = client.responses.parse(
-            model="gpt-5-mini",
-            input=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
-            text_format=AIRiskNarrative,
+        response = (
+            openai_client
+            .responses
+            .parse(
+                model="gpt-5-mini",
+                input=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                text_format=AIRiskNarrative,
+            )
         )
 
         analysis = response.output_parsed
@@ -156,6 +285,64 @@ Human review required: {requires_human_review}
             detail=f"AI analysis failed: {exc}",
         )
 
+    history_row = {
+        "portfolio_id":
+            data.portfolioId,
+
+        "portfolio_name":
+            data.portfolioName,
+
+        "valuation":
+            data.currentValuation,
+
+        "debt":
+            data.debt,
+
+        "ltv":
+            data.currentLTV,
+
+        "risk_threshold":
+            data.riskThreshold,
+
+        "threshold_breach":
+            round(
+                threshold_breach,
+                2,
+            ),
+
+        "risk_level":
+            risk_level,
+
+        "risk_triggered":
+            data.riskTriggered,
+
+        "valuation_confidence":
+            data.valuationConfidence,
+
+        "ai_summary":
+            analysis.summary,
+
+        "recommended_action":
+            analysis.recommendedAction,
+
+        "requires_human_review":
+            requires_human_review,
+    }
+
+    try:
+        (
+            supabase
+            .table("risk_history")
+            .insert(history_row)
+            .execute()
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Risk history insert failed: {exc}",
+        )
+
     return RiskResponse(
         riskLevel=risk_level,
         summary=analysis.summary,
@@ -163,6 +350,10 @@ Human review required: {requires_human_review}
             threshold_breach,
             2,
         ),
-        recommendedAction=analysis.recommendedAction,
-        requiresHumanReview=requires_human_review,
+        recommendedAction=(
+            analysis.recommendedAction
+        ),
+        requiresHumanReview=(
+            requires_human_review
+        ),
     )
