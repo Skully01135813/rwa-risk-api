@@ -357,3 +357,84 @@ Human review required: {requires_human_review}
             requires_human_review
         ),
     )
+
+@app.get(
+    "/latest/{portfolio_id}",
+    response_model=RiskHistoryItem,
+)
+def get_latest_risk_assessment(
+    portfolio_id: str,
+):
+    try:
+        response = (
+            supabase
+            .table("risk_history")
+            .select("*")
+            .eq(
+                "portfolio_id",
+                portfolio_id,
+            )
+            .order(
+                "created_at",
+                desc=True,
+            )
+            .limit(1)
+            .execute()
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Latest risk query failed: {exc}",
+        )
+
+    if not response.data:
+        raise HTTPException(
+            status_code=404,
+            detail="No risk assessment found.",
+        )
+
+    row = response.data[0]
+
+    return RiskHistoryItem(
+        id=row["id"],
+        portfolioId=row["portfolio_id"],
+        portfolioName=row["portfolio_name"],
+        valuation=float(
+            row["valuation"]
+        ),
+        debt=float(
+            row["debt"]
+        ),
+        ltv=float(
+            row["ltv"]
+        ),
+        riskThreshold=float(
+            row["risk_threshold"]
+        ),
+        thresholdBreach=float(
+            row["threshold_breach"]
+        ),
+        riskLevel=row["risk_level"],
+        riskTriggered=row["risk_triggered"],
+        valuationConfidence=(
+            float(
+                row[
+                    "valuation_confidence"
+                ]
+            )
+            if row[
+                "valuation_confidence"
+            ]
+            is not None
+            else None
+        ),
+        aiSummary=row["ai_summary"],
+        recommendedAction=row[
+            "recommended_action"
+        ],
+        requiresHumanReview=row[
+            "requires_human_review"
+        ],
+        createdAt=row["created_at"],
+    )
