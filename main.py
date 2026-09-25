@@ -1,7 +1,7 @@
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from openai import OpenAI
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -171,20 +171,12 @@ def get_risk_history(
 
     return history
 
-
-@app.post(
-    "/analyze",
-    response_model=RiskResponse,
-)
-def analyze_risk(
+def run_ai_analysis_background(
     data: RiskRequest,
+    threshold_breach: float,
+    risk_level: str,
+    requires_human_review: bool,
 ):
-    threshold_breach = max(
-        data.currentLTV
-        - data.riskThreshold,
-        0,
-    )
-
     valuation_change = (
         (
             data.currentValuation
@@ -192,13 +184,6 @@ def analyze_risk(
         )
         / data.previousValuation
     ) * 100
-
-    if data.riskTriggered:
-        risk_level = "HIGH"
-        requires_human_review = True
-    else:
-        risk_level = "LOW"
-        requires_human_review = False
 
     system_prompt = """
 You are an RWA portfolio risk analyst.
@@ -279,57 +264,50 @@ Human review required: {requires_human_review}
                 "Model returned no structured analysis."
             )
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"AI analysis failed: {exc}",
-        )
+        history_row = {
+            "portfolio_id":
+                data.portfolioId,
 
-    history_row = {
-        "portfolio_id":
-            data.portfolioId,
+            "portfolio_name":
+                data.portfolioName,
 
-        "portfolio_name":
-            data.portfolioName,
+            "valuation":
+                data.currentValuation,
 
-        "valuation":
-            data.currentValuation,
+            "debt":
+                data.debt,
 
-        "debt":
-            data.debt,
+            "ltv":
+                data.currentLTV,
 
-        "ltv":
-            data.currentLTV,
+            "risk_threshold":
+                data.riskThreshold,
 
-        "risk_threshold":
-            data.riskThreshold,
+            "threshold_breach":
+                round(
+                    threshold_breach,
+                    2,
+                ),
 
-        "threshold_breach":
-            round(
-                threshold_breach,
-                2,
-            ),
+            "risk_level":
+                risk_level,
 
-        "risk_level":
-            risk_level,
+            "risk_triggered":
+                data.riskTriggered,
 
-        "risk_triggered":
-            data.riskTriggered,
+            "valuation_confidence":
+                data.valuationConfidence,
 
-        "valuation_confidence":
-            data.valuationConfidence,
+            "ai_summary":
+                analysis.summary,
 
-        "ai_summary":
-            analysis.summary,
+            "recommended_action":
+                analysis.recommendedAction,
 
-        "recommended_action":
-            analysis.recommendedAction,
+            "requires_human_review":
+                requires_human_review,
+        }
 
-        "requires_human_review":
-            requires_human_review,
-    }
-
-    try:
         (
             supabase
             .table("risk_history")
@@ -337,26 +315,86 @@ Human review required: {requires_human_review}
             .execute()
         )
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Risk history insert failed: {exc}",
+        print(
+            f"Background AI analysis completed for "
+            f"{data.portfolioId}"
         )
+
+    except Exception as exc:
+        print(
+            f"Background AI analysis failed for "
+            f"{data.portfolioId}: {exc}"
+        )
+
+
+@app.post(
+    "/analyze",
+    response_model=RiskResponse,
+)
+def analyze_risk(
+    data: RiskRequest,
+    background_tasks: BackgroundTasks,
+):
+    threshold_breach = max(
+        data.currentLTV
+        - data.riskThreshold,
+        0,
+    )
+
+    if data.riskTriggered:
+        risk_level = "HIGH"
+        requires_human_review = True
+
+        summary = (
+            f"{data.portfolioName} has a current LTV of "
+            f"{data.currentLTV:.2f}%, exceeding the "
+            f"{data.riskThreshold:.2f}% risk threshold by "
+            f"{threshold_breach:.2f} percentage points. "
+            "Human review is required."
+        )
+
+        recommended_action = (
+            "Review the verified risk condition and evaluate "
+            "appropriate mitigation options."
+        )
+
+    else:
+        risk_level = "LOW"
+        requires_human_review = False
+
+        summary = (
+            f"{data.portfolioName} has a current LTV of "
+            f"{data.currentLTV:.2f}%, within the "
+            f"{data.riskThreshold:.2f}% risk threshold."
+        )
+
+        recommended_action = (
+            "Continue monitoring the portfolio under the "
+            "configured risk controls."
+        )
+
+    background_tasks.add_task(
+        run_ai_analysis_background,
+        data,
+        threshold_breach,
+        risk_level,
+        requires_human_review,
+    )
+    
 
     return RiskResponse(
         riskLevel=risk_level,
-        summary=analysis.summary,
+        summary=summary,
         thresholdBreach=round(
             threshold_breach,
             2,
         ),
-        recommendedAction=(
-            analysis.recommendedAction
-        ),
-        requiresHumanReview=(
-            requires_human_review
-        ),
+        recommendedAction=recommended_action,
+        requiresHumanReview=requires_human_review,
     )
+
+
+
 
 @app.get(
     "/latest/{portfolio_id}",
